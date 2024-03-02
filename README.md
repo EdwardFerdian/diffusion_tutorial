@@ -12,6 +12,8 @@ Create a new environment with Python 3.10 and install the package in editable mo
 ```bash
 conda create -n tutorial python=3.10
 conda activate tutorial
+
+# Clone this github repository and go to the root folder
 pip install -e .
 ```
 
