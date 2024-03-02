@@ -73,6 +73,7 @@ python sampler_cfg_2d.py --model-dir [model_dir] [--num-classes 10]
 
 ## 1D diffusion model
 
+For unconditional 1D diffusion, you need to put your data into a .h5 file with an _input_ column.
 
 #### Training
 
@@ -90,4 +91,24 @@ python trainer_1d.py --input-file data.h5 --output-dir models [--seq-length 480]
 
 ```bash
 python sampler_1d.py --model-dir models
+```
+
+## 1D classifier-free guidance
+
+For classifier-free guidance, you need to put your data into a .h5 file with an _input_ column and a _labels_ column.
+
+#### Training
+
+1. Prepare your data in a HDF5 file with containing an _input_ and a _labels_ column
+2. Run the training script
+
+```bash
+# Input your data path and output dir. The seq-length is the length of the input sequence
+python trainer_cfg_1d.py --input-file [data.h5] --output-dir [model_dir] [--seq-length 480] [--num-classes 10]
+```
+
+#### Inference
+
+```bash
+python sampler_cfg_1d.py --model-dir [model_dir] [--num-classes 10]
 ```
