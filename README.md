@@ -40,6 +40,37 @@ python trainer_2d.py --data-dir [data_dir] --output-dir [model_dir] [--channels 
 python sampler_2d.py --model-dir models
 ```
 
+### Classifier-free guidance
+
+For classifier-free guidance, you have to put the data in the 'data' folder consisting of subfolders corresponding to the different classes (e.g., 0, 1, 2, ...). The training script will then use the class labels as guidance.
+
+Example data dir structure
+
+```
+data
+├── 0
+│   ├── 0.png
+│   ├── 1.png
+├── 1
+│   ├── 0.png
+│   ├── 1.png
+└── 2
+    ├── 0.png
+    ├── 1.png
+```
+
+#### Training
+
+```bash
+python trainer_cfg_2d.py --data-dir [data_dir] --output-dir [model_dir] [--channels 3] [--num-classes 10]
+```
+
+#### Inference
+
+```bash
+python sampler_cfg_2d.py --model-dir [model_dir] [--num-classes 10]
+```
+
 ## 1D diffusion model
 
 #### Training
