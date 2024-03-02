@@ -25,7 +25,9 @@ setup(
     'pytorch-fid',
     'torch',
     'torchvision',
-    'tqdm'
+    'tqdm',
+    'matplotlib',
+    'h5py'
   ],
   classifiers=[
     'Development Status :: 4 - Beta',

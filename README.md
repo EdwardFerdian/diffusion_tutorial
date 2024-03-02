@@ -16,7 +16,9 @@ pip install -e .
 2. Run the training script
 
 ```bash
-python trainer_2d.py --data-dir data --output-dir models
+# Input your data and output dir. The channels is the number of channels in the input data
+python trainer_2d.py --data-dir data --output-dir models --channels 3
+
 ```
 
 #### Inference
@@ -24,5 +26,5 @@ python trainer_2d.py --data-dir data --output-dir models
 1. Run the inference script
 
 ```bash
-python sampler_2d.py --model-path models/model.pth --output-dir results
+python sampler_2d.py --model-dir models
 ```

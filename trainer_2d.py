@@ -24,7 +24,7 @@ if __name__ == "__main__":
         model,
         image_size = 64,
         timesteps = 1000,           
-        sampling_timesteps = 100,   
+        sampling_timesteps = 250,   
     ).cuda()
 
     trainer = Trainer(
