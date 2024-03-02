@@ -1,29 +1,32 @@
 import math
+import copy
+from pathlib import Path
 from random import random
 from functools import partial
 from collections import namedtuple
-from pathlib import Path
 from multiprocessing import cpu_count
 
 import torch
-from torch import nn, einsum, Tensor
+from torch import nn, einsum
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 from torch.utils.data import Dataset, DataLoader
+
+from einops import rearrange, reduce, repeat
+from einops.layers.torch import Rearrange
+
+from PIL import Image
+from torch.optim import Adam
 from torchvision import transforms as T, utils
 
-from einops import rearrange, reduce
-from einops.layers.torch import Rearrange
-from torch.cuda.amp import autocast
-from torch.optim import Adam
-
 from tqdm.auto import tqdm
+
 from ema_pytorch import EMA
 
 from accelerate import Accelerator
+
 from denoising_diffusion_pytorch.version import __version__
 import numpy as np
-import h5py as h5py
-import matplotlib.pyplot as plt
 
 # constants
 
@@ -71,6 +74,19 @@ def normalize_to_neg_one_to_one(img):
 def unnormalize_to_zero_to_one(t):
     return (t + 1) * 0.5
 
+# classifier free guidance functions
+
+def uniform(shape, device):
+    return torch.zeros(shape, device = device).float().uniform_(0, 1)
+
+def prob_mask_like(shape, prob, device):
+    if prob == 1:
+        return torch.ones(shape, device = device, dtype = torch.bool)
+    elif prob == 0:
+        return torch.zeros(shape, device = device, dtype = torch.bool)
+    else:
+        return torch.zeros(shape, device = device).float().uniform_(0, 1) < prob
+
 # small helper modules
 
 class Residual(nn.Module):
@@ -84,16 +100,16 @@ class Residual(nn.Module):
 def Upsample(dim, dim_out = None):
     return nn.Sequential(
         nn.Upsample(scale_factor = 2, mode = 'nearest'),
-        nn.Conv1d(dim, default(dim_out, dim), 3, padding = 1)
+        nn.Conv2d(dim, default(dim_out, dim), 3, padding = 1)
     )
 
 def Downsample(dim, dim_out = None):
-    return nn.Conv1d(dim, default(dim_out, dim), 4, 2, 1)
+    return nn.Conv2d(dim, default(dim_out, dim), 4, 2, 1)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.g = nn.Parameter(torch.ones(1, dim, 1))
+        self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
 
     def forward(self, x):
         return F.normalize(x, dim = 1) * self.g * (x.shape[1] ** 0.5)
@@ -111,15 +127,14 @@ class PreNorm(nn.Module):
 # sinusoidal positional embeds
 
 class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim, theta = 10000):
+    def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        self.theta = theta
 
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
-        emb = math.log(self.theta) / (half_dim - 1)
+        emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
@@ -147,7 +162,7 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim, dim_out, groups = 8):
         super().__init__()
-        self.proj = nn.Conv1d(dim, dim_out, 3, padding = 1)
+        self.proj = nn.Conv2d(dim, dim_out, 3, padding = 1)
         self.norm = nn.GroupNorm(groups, dim_out)
         self.act = nn.SiLU()
 
@@ -163,24 +178,26 @@ class Block(nn.Module):
         return x
 
 class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out, *, time_emb_dim = None, groups = 8):
+    def __init__(self, dim, dim_out, *, time_emb_dim = None, classes_emb_dim = None, groups = 8):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_emb_dim, dim_out * 2)
-        ) if exists(time_emb_dim) else None
+            nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim_out * 2)
+        ) if exists(time_emb_dim) or exists(classes_emb_dim) else None
 
         self.block1 = Block(dim, dim_out, groups = groups)
         self.block2 = Block(dim_out, dim_out, groups = groups)
-        self.res_conv = nn.Conv1d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
-    def forward(self, x, time_emb = None):
+    def forward(self, x, time_emb = None, class_emb = None):
 
         scale_shift = None
-        if exists(self.mlp) and exists(time_emb):
-            time_emb = self.mlp(time_emb)
-            time_emb = rearrange(time_emb, 'b c -> b c 1')
-            scale_shift = time_emb.chunk(2, dim = 1)
+        if exists(self.mlp) and (exists(time_emb) or exists(class_emb)):
+            cond_emb = tuple(filter(exists, (time_emb, class_emb)))
+            cond_emb = torch.cat(cond_emb, dim = -1)
+            cond_emb = self.mlp(cond_emb)
+            cond_emb = rearrange(cond_emb, 'b c -> b c 1 1')
+            scale_shift = cond_emb.chunk(2, dim = 1)
 
         h = self.block1(x, scale_shift = scale_shift)
 
@@ -194,27 +211,27 @@ class LinearAttention(nn.Module):
         self.scale = dim_head ** -0.5
         self.heads = heads
         hidden_dim = dim_head * heads
-        self.to_qkv = nn.Conv1d(dim, hidden_dim * 3, 1, bias = False)
+        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
 
         self.to_out = nn.Sequential(
-            nn.Conv1d(hidden_dim, dim, 1),
+            nn.Conv2d(hidden_dim, dim, 1),
             RMSNorm(dim)
         )
 
     def forward(self, x):
-        b, c, n = x.shape
+        b, c, h, w = x.shape
         qkv = self.to_qkv(x).chunk(3, dim = 1)
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) n -> b h c n', h = self.heads), qkv)
+        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h c (x y)', h = self.heads), qkv)
 
         q = q.softmax(dim = -2)
         k = k.softmax(dim = -1)
 
-        q = q * self.scale        
+        q = q * self.scale
 
         context = torch.einsum('b h d n, b h e n -> b h d e', k, v)
 
         out = torch.einsum('b h d e, b h d n -> b h e n', context, q)
-        out = rearrange(out, 'b h c n -> b (h c) n', h = self.heads)
+        out = rearrange(out, 'b h c (x y) -> b (h c) x y', h = self.heads, x = h, y = w)
         return self.to_out(out)
 
 class Attention(nn.Module):
@@ -224,13 +241,13 @@ class Attention(nn.Module):
         self.heads = heads
         hidden_dim = dim_head * heads
 
-        self.to_qkv = nn.Conv1d(dim, hidden_dim * 3, 1, bias = False)
-        self.to_out = nn.Conv1d(hidden_dim, dim, 1)
+        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
+        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
 
     def forward(self, x):
-        b, c, n = x.shape
+        b, c, h, w = x.shape
         qkv = self.to_qkv(x).chunk(3, dim = 1)
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) n -> b h c n', h = self.heads), qkv)
+        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h c (x y)', h = self.heads), qkv)
 
         q = q * self.scale
 
@@ -238,39 +255,42 @@ class Attention(nn.Module):
         attn = sim.softmax(dim = -1)
         out = einsum('b h i j, b h d j -> b h i d', attn, v)
 
-        out = rearrange(out, 'b h n d -> b (h d) n')
+        out = rearrange(out, 'b h (x y) d -> b (h d) x y', x = h, y = w)
         return self.to_out(out)
 
 # model
 
-class Unet1D(nn.Module):
+class Unet(nn.Module):
     def __init__(
         self,
         dim,
+        num_classes,
+        cond_drop_prob = 0.1,
         init_dim = None,
         out_dim = None,
         dim_mults=(1, 2, 4, 8),
         channels = 3,
-        self_condition = False,
         resnet_block_groups = 8,
         learned_variance = False,
         learned_sinusoidal_cond = False,
         random_fourier_features = False,
         learned_sinusoidal_dim = 16,
-        sinusoidal_pos_emb_theta = 10000,
         attn_dim_head = 32,
         attn_heads = 4
     ):
         super().__init__()
 
+        # classifier free guidance stuff
+
+        self.cond_drop_prob = cond_drop_prob
+
         # determine dimensions
 
         self.channels = channels
-        self.self_condition = self_condition
-        input_channels = channels * (2 if self_condition else 1)
+        input_channels = channels
 
         init_dim = default(init_dim, dim)
-        self.init_conv = nn.Conv1d(input_channels, init_dim, 7, padding = 3)
+        self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding = 3)
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
@@ -287,7 +307,7 @@ class Unet1D(nn.Module):
             sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(learned_sinusoidal_dim, random_fourier_features)
             fourier_dim = learned_sinusoidal_dim + 1
         else:
-            sinu_pos_emb = SinusoidalPosEmb(dim, theta = sinusoidal_pos_emb_theta)
+            sinu_pos_emb = SinusoidalPosEmb(dim)
             fourier_dim = dim
 
         self.time_mlp = nn.Sequential(
@@ -295,6 +315,19 @@ class Unet1D(nn.Module):
             nn.Linear(fourier_dim, time_dim),
             nn.GELU(),
             nn.Linear(time_dim, time_dim)
+        )
+
+        # class embeddings
+
+        self.classes_emb = nn.Embedding(num_classes, dim)
+        self.null_classes_emb = nn.Parameter(torch.randn(dim))
+
+        classes_dim = dim * 4
+
+        self.classes_mlp = nn.Sequential(
+            nn.Linear(dim, classes_dim),
+            nn.GELU(),
+            nn.Linear(classes_dim, classes_dim)
         )
 
         # layers
@@ -307,37 +340,84 @@ class Unet1D(nn.Module):
             is_last = ind >= (num_resolutions - 1)
 
             self.downs.append(nn.ModuleList([
-                block_klass(dim_in, dim_in, time_emb_dim = time_dim),
-                block_klass(dim_in, dim_in, time_emb_dim = time_dim),
+                block_klass(dim_in, dim_in, time_emb_dim = time_dim, classes_emb_dim = classes_dim),
+                block_klass(dim_in, dim_in, time_emb_dim = time_dim, classes_emb_dim = classes_dim),
                 Residual(PreNorm(dim_in, LinearAttention(dim_in))),
-                Downsample(dim_in, dim_out) if not is_last else nn.Conv1d(dim_in, dim_out, 3, padding = 1)
+                Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 3, padding = 1)
             ]))
 
         mid_dim = dims[-1]
-        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
+        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim, classes_emb_dim = classes_dim)
         self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim, dim_head = attn_dim_head, heads = attn_heads)))
-        self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
+        self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim, classes_emb_dim = classes_dim)
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind == (len(in_out) - 1)
 
             self.ups.append(nn.ModuleList([
-                block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim),
-                block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim),
+                block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim, classes_emb_dim = classes_dim),
+                block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim, classes_emb_dim = classes_dim),
                 Residual(PreNorm(dim_out, LinearAttention(dim_out))),
-                Upsample(dim_out, dim_in) if not is_last else  nn.Conv1d(dim_out, dim_in, 3, padding = 1)
+                Upsample(dim_out, dim_in) if not is_last else  nn.Conv2d(dim_out, dim_in, 3, padding = 1)
             ]))
 
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, default_out_dim)
 
-        self.final_res_block = block_klass(dim * 2, dim, time_emb_dim = time_dim)
-        self.final_conv = nn.Conv1d(dim, self.out_dim, 1)
+        self.final_res_block = block_klass(dim * 2, dim, time_emb_dim = time_dim, classes_emb_dim = classes_dim)
+        self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
 
-    def forward(self, x, time, x_self_cond = None):
-        if self.self_condition:
-            x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
-            x = torch.cat((x_self_cond, x), dim = 1)
+    def forward_with_cond_scale(
+        self,
+        *args,
+        cond_scale = 1.,
+        rescaled_phi = 0.,
+        **kwargs
+    ):
+        logits = self.forward(*args, cond_drop_prob = 0, **kwargs)
+
+        if cond_scale == 1:
+            return logits
+
+        null_logits = self.forward(*args, cond_drop_prob = 1., **kwargs)
+        scaled_logits = null_logits + (logits - null_logits) * cond_scale
+
+        if rescaled_phi == 0.:
+            return scaled_logits
+
+        std_fn = partial(torch.std, dim = tuple(range(1, scaled_logits.ndim)), keepdim = True)
+        rescaled_logits = scaled_logits * (std_fn(logits) / std_fn(scaled_logits))
+
+        return rescaled_logits * rescaled_phi + scaled_logits * (1. - rescaled_phi)
+
+    def forward(
+        self,
+        x,
+        time,
+        classes,
+        cond_drop_prob = None
+    ):
+        batch, device = x.shape[0], x.device
+
+        cond_drop_prob = default(cond_drop_prob, self.cond_drop_prob)
+
+        # derive condition, with condition dropout for classifier free guidance        
+
+        classes_emb = self.classes_emb(classes)
+
+        if cond_drop_prob > 0:
+            keep_mask = prob_mask_like((batch,), 1 - cond_drop_prob, device = device)
+            null_classes_emb = repeat(self.null_classes_emb, 'd -> b d', b = batch)
+
+            classes_emb = torch.where(
+                rearrange(keep_mask, 'b -> b 1'),
+                classes_emb,
+                null_classes_emb
+            )
+
+        c = self.classes_mlp(classes_emb)
+
+        # unet
 
         x = self.init_conv(x)
         r = x.clone()
@@ -347,32 +427,32 @@ class Unet1D(nn.Module):
         h = []
 
         for block1, block2, attn, downsample in self.downs:
-            x = block1(x, t)
+            x = block1(x, t, c)
             h.append(x)
 
-            x = block2(x, t)
+            x = block2(x, t, c)
             x = attn(x)
             h.append(x)
 
             x = downsample(x)
 
-        x = self.mid_block1(x, t)
+        x = self.mid_block1(x, t, c)
         x = self.mid_attn(x)
-        x = self.mid_block2(x, t)
+        x = self.mid_block2(x, t, c)
 
         for block1, block2, attn, upsample in self.ups:
             x = torch.cat((x, h.pop()), dim = 1)
-            x = block1(x, t)
+            x = block1(x, t, c)
 
             x = torch.cat((x, h.pop()), dim = 1)
-            x = block2(x, t)
+            x = block2(x, t, c)
             x = attn(x)
 
             x = upsample(x)
 
         x = torch.cat((x, r), dim = 1)
 
-        x = self.final_res_block(x, t)
+        x = self.final_res_block(x, t, c)
         return self.final_conv(x)
 
 # gaussian diffusion trainer class
@@ -400,25 +480,29 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
-class GaussianDiffusion1D(nn.Module):
+class GaussianDiffusion(nn.Module):
     def __init__(
         self,
         model,
         *,
-        seq_length,
+        image_size,
         timesteps = 1000,
         sampling_timesteps = None,
         objective = 'pred_noise',
         beta_schedule = 'cosine',
-        ddim_sampling_eta = 0.,
-        auto_normalize = True
+        ddim_sampling_eta = 1.,
+        offset_noise_strength = 0.,
+        min_snr_loss_weight = False,
+        min_snr_gamma = 5
     ):
         super().__init__()
+        assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
+        assert not model.random_or_learned_sinusoidal_cond
+
         self.model = model
         self.channels = self.model.channels
-        self.self_condition = self.model.self_condition
 
-        self.seq_length = seq_length
+        self.image_size = image_size
 
         self.objective = objective
 
@@ -476,23 +560,30 @@ class GaussianDiffusion1D(nn.Module):
         register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
-        # calculate loss weight
+        # offset noise strength - 0.1 was claimed ideal
+
+        self.offset_noise_strength = offset_noise_strength
+
+        # loss weight
 
         snr = alphas_cumprod / (1 - alphas_cumprod)
 
+        maybe_clipped_snr = snr.clone()
+        if min_snr_loss_weight:
+            maybe_clipped_snr.clamp_(max = min_snr_gamma)
+
         if objective == 'pred_noise':
-            loss_weight = torch.ones_like(snr)
+            loss_weight = maybe_clipped_snr / snr
         elif objective == 'pred_x0':
-            loss_weight = snr
+            loss_weight = maybe_clipped_snr
         elif objective == 'pred_v':
-            loss_weight = snr / (snr + 1)
+            loss_weight = maybe_clipped_snr / (snr + 1)
 
         register_buffer('loss_weight', loss_weight)
 
-        # whether to autonormalize
-
-        self.normalize = normalize_to_neg_one_to_one if auto_normalize else identity
-        self.unnormalize = unnormalize_to_zero_to_one if auto_normalize else identity
+    @property
+    def device(self):
+        return self.betas.device
 
     def predict_start_from_noise(self, x_t, t, noise):
         return (
@@ -527,17 +618,14 @@ class GaussianDiffusion1D(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        model_output = self.model(x, t, x_self_cond)
+    def model_predictions(self, x, t, classes, cond_scale = 6., rescaled_phi = 0.7, clip_x_start = False):
+        model_output = self.model.forward_with_cond_scale(x, t, classes, cond_scale = cond_scale, rescaled_phi = rescaled_phi)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
             pred_noise = model_output
             x_start = self.predict_start_from_noise(x, t, pred_noise)
             x_start = maybe_clip(x_start)
-
-            if clip_x_start and rederive_pred_noise:
-                pred_noise = self.predict_noise_from_start(x, t, x_start)
 
         elif self.objective == 'pred_x0':
             x_start = model_output
@@ -552,8 +640,8 @@ class GaussianDiffusion1D(nn.Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, x_self_cond)
+    def p_mean_variance(self, x, t, classes, cond_scale, rescaled_phi, clip_denoised = True):
+        preds = self.model_predictions(x, t, classes, cond_scale, rescaled_phi)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -563,16 +651,16 @@ class GaussianDiffusion1D(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, t: int, x_self_cond = None, clip_denoised = True):
+    def p_sample(self, x, t: int, classes, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True):
         b, *_, device = *x.shape, x.device
-        batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = clip_denoised)
+        batched_times = torch.full((x.shape[0],), t, device = x.device, dtype = torch.long)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, classes = classes, cond_scale = cond_scale, rescaled_phi = rescaled_phi, clip_denoised = clip_denoised)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, shape):
+    def p_sample_loop(self, classes, shape, cond_scale = 6., rescaled_phi = 0.7):
         batch, device = shape[0], self.betas.device
 
         img = torch.randn(shape, device=device)
@@ -580,14 +668,13 @@ class GaussianDiffusion1D(nn.Module):
         x_start = None
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
-            self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond)
+            img, x_start = self.p_sample(img, t, classes, cond_scale, rescaled_phi)
 
-        img = self.unnormalize(img)
+        img = unnormalize_to_zero_to_one(img)
         return img
 
     @torch.no_grad()
-    def ddim_sample(self, shape, clip_denoised = True):
+    def ddim_sample(self, classes, shape, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -600,8 +687,7 @@ class GaussianDiffusion1D(nn.Module):
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = clip_denoised)
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, classes, cond_scale = cond_scale, rescaled_phi = rescaled_phi, clip_x_start = clip_denoised)
 
             if time_next < 0:
                 img = x_start
@@ -619,32 +705,29 @@ class GaussianDiffusion1D(nn.Module):
                   c * pred_noise + \
                   sigma * noise
 
-        img = self.unnormalize(img)
+        img = unnormalize_to_zero_to_one(img)
         return img
 
     @torch.no_grad()
-    def sample(self, batch_size = 16):
-        seq_length, channels = self.seq_length, self.channels
+    def sample(self, classes, cond_scale = 1., rescaled_phi = 0.7):
+        batch_size, image_size, channels = classes.shape[0], self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, seq_length))
+        return sample_fn(classes, (batch_size, channels, image_size, image_size), cond_scale, rescaled_phi)
 
     @torch.no_grad()
-    def interpolate(self, x1, x2, t = None, lam = 0.5):
+    def interpolate(self, x1, x2, classes, t = None, lam = 0.5):
         b, *_, device = *x1.shape, x1.device
         t = default(t, self.num_timesteps - 1)
 
         assert x1.shape == x2.shape
 
-        t_batched = torch.full((b,), t, device = device)
+        t_batched = torch.stack([torch.tensor(t, device = device)] * b)
         xt1, xt2 = map(lambda x: self.q_sample(x, t = t_batched), (x1, x2))
 
         img = (1 - lam) * xt1 + lam * xt2
 
-        x_start = None
-
         for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
-            self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, i, self_cond)
+            img, _ = self.p_sample(img, i, classes)
 
         return img
 
@@ -652,32 +735,26 @@ class GaussianDiffusion1D(nn.Module):
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
+        if self.offset_noise_strength > 0.:
+            offset_noise = torch.randn(x_start.shape[:2], device = self.device)
+            noise += self.offset_noise_strength * rearrange(offset_noise, 'b c -> b c 1 1')
+
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None):
-        b, c, n = x_start.shape
+    def p_losses(self, x_start, t, *, classes, noise = None):
+        b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # noise sample
 
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
 
-        # if doing self-conditioning, 50% of the time, predict x_start from current set of times
-        # and condition with unet with that
-        # this technique will slow down training by 25%, but seems to lower FID significantly
-
-        x_self_cond = None
-        if self.self_condition and random() < 0.5:
-            with torch.no_grad():
-                x_self_cond = self.model_predictions(x, t).pred_x_start
-                x_self_cond.detach_()
-
         # predict and take gradient step
 
-        model_out = self.model(x, t, x_self_cond)
+        model_out = self.model(x, t, classes)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -695,65 +772,62 @@ class GaussianDiffusion1D(nn.Module):
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
-    def forward(self, img, *args, **kwargs):
-        b, c, n, device, seq_length, = *img.shape, img.device, self.seq_length
-        assert n == seq_length, f'seq length must be {seq_length}'
+    def forward(self, img, classes, *args, **kwargs):
+        b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
+        assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        img = self.normalize(img)
-        return self.p_losses(img, t, *args, **kwargs)
+        img = normalize_to_neg_one_to_one(img)
+        return self.p_losses(img, t, *args, classes=classes, **kwargs)
 
 
-class Dataset1D(Dataset):
-    
+# dataset classes
 
+class Dataset(Dataset):
     def __init__(
         self,
-        h5_filepath,
-        seq_length,
+        folder,
+        image_size,
+        exts = ['jpg', 'jpeg', 'png', 'tiff'],
+        augment_horizontal_flip = False,
+        convert_image_to = None
     ):
         super().__init__()
-        self.h5_filepath = h5_filepath
-        self.seq_length = seq_length
-        
-        # open h5
-        h5handler = h5py.File(h5_filepath, 'r')
-        self.data = np.asarray(h5handler["input"])
-        
-        print(f"Before norm {np.min(self.data)} {np.max(self.data)}")
+        self.folder = folder
+        self.image_size = image_size
+        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
 
-        # normalize data 
-        self.data = (self.data - np.min(self.data)) / (np.max(self.data) - np.min(self.data))
-
-        self.min_data = np.min(self.data)
-        self.max_data = np.max(self.data)
-
-        print(f"After norm {np.min(self.data)} {np.max(self.data)}")
+        maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
 
         self.transform = T.Compose([
+            T.Lambda(maybe_convert_fn),
+            T.Resize(image_size),
+            T.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
+            # T.CenterCrop(image_size),
             T.ToTensor()
         ])
 
     def __len__(self):
-        return len(self.data)
+        return len(self.paths)
 
     def __getitem__(self, index):
-        seq = self.data[index]
-        seq = seq[:self.seq_length]
-        # add first dim
-        seq = np.expand_dims(seq, axis=0)
-        # return self.transform(seq)
-        seq = torch.tensor(seq, dtype=torch.float)
-        return seq
+        path = self.paths[index]
+        img = Image.open(path)
+        img = self.transform(img)
+        label = int(path.parent.name)
+        
+        return img, label
 
-class Trainer1D(object):
+class Trainer(object):
     def __init__(
         self,
         diffusion_model,
-        input_filepath,
+        folder,
+        num_classes,
         *,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
+        augment_horizontal_flip = False,
         train_lr = 1e-4,
         train_num_steps = 100000,
         ema_update_every = 10,
@@ -763,25 +837,21 @@ class Trainer1D(object):
         num_samples = 16,
         results_folder = './results',
         amp = False,
-        mixed_precision_type = 'fp16',
+        fp16 = False,
         split_batches = True,
-        max_grad_norm = 1.
+        convert_image_to = None
     ):
         super().__init__()
 
-        # accelerator
-
         self.accelerator = Accelerator(
             split_batches = split_batches,
-            mixed_precision = mixed_precision_type if amp else 'no'
+            mixed_precision = 'fp16' if fp16 else 'no'
         )
 
-        # model
+        self.accelerator.native_amp = amp
 
         self.model = diffusion_model
-        self.channels = diffusion_model.channels
-
-        # sampling and training hyperparameters
+        self.num_classes = num_classes
 
         assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
         self.num_samples = num_samples
@@ -789,18 +859,16 @@ class Trainer1D(object):
 
         self.batch_size = train_batch_size
         self.gradient_accumulate_every = gradient_accumulate_every
-        self.max_grad_norm = max_grad_norm
 
         self.train_num_steps = train_num_steps
-        self.seq_length = diffusion_model.seq_length
+        self.image_size = diffusion_model.image_size
 
         # dataset and dataloader
-
-        if input_filepath is None:
+        if folder is None:
             self.ds = None
             self.dl = None
         else:
-            self.ds = Dataset1D(input_filepath, self.seq_length)
+            self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
             dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
 
             dl = self.accelerator.prepare(dl)
@@ -814,7 +882,6 @@ class Trainer1D(object):
 
         if self.accelerator.is_main_process:
             self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
-            self.ema.to(self.device)
 
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
@@ -826,10 +893,6 @@ class Trainer1D(object):
         # prepare model, dataloader, optimizer with accelerator
 
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
-
-    @property
-    def device(self):
-        return self.accelerator.device
 
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
@@ -857,8 +920,7 @@ class Trainer1D(object):
 
         self.step = data['step']
         self.opt.load_state_dict(data['opt'])
-        if self.accelerator.is_main_process:
-            self.ema.load_state_dict(data["ema"])
+        self.ema.load_state_dict(data['ema'])
 
         if 'version' in data:
             print(f"loading from version {data['version']}")
@@ -877,19 +939,24 @@ class Trainer1D(object):
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
+                    # data = next(self.dl).to(device)
+                    data = next(self.dl)
+
+                    (data_x, data_y) = data
+                    data_x = data_x.to(device)
+                    data_y = data_y.to(device)
 
                     with self.accelerator.autocast():
-                        loss = self.model(data)
+                        loss = self.model(data_x, data_y)
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 
                     self.accelerator.backward(loss)
 
+                accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
                 pbar.set_description(f'loss: {total_loss:.4f}')
 
                 accelerator.wait_for_everyone()
-                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                 self.opt.step()
                 self.opt.zero_grad()
@@ -898,6 +965,7 @@ class Trainer1D(object):
 
                 self.step += 1
                 if accelerator.is_main_process:
+                    self.ema.to(device)
                     self.ema.update()
 
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
@@ -905,33 +973,16 @@ class Trainer1D(object):
 
                         with torch.no_grad():
                             milestone = self.step // self.save_and_sample_every
-                            batches = num_to_groups(self.num_samples, self.batch_size)
-                            all_result_samples = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+                            image_classes = torch.randint(0, self.num_classes, (self.batch_size,)).cuda()
+                            
+                            all_images_list = [self.ema.ema_model.sample(classes=image_classes)]  
+                            
 
-                        all_images = torch.cat(all_result_samples, dim = 0)
-                        all_images = all_images.squeeze(1)
-                        all_images = all_images.cpu().numpy()
-                        
-                        # save as txt
-                        np.savetxt(str(self.results_folder / f'sample-{self.step}.txt'), all_images)
-
-                        nr_imgs = len(all_images)
-                        nrow = ncol = int(math.sqrt(nr_imgs))
-                        # denormalize
-                        all_images = all_images * (self.ds.max_data - self.ds.min_data) + self.ds.min_data
-                        
-                        # plot nrow x ncol
-                        fig, axs = plt.subplots(nrow, ncol, figsize=(10,10))
-                        for i in range(nrow):
-                            for j in range(ncol):
-                                axs[i, j].plot(all_images[i * nrow + j])
-                                axs[i, j].set_xlim([0, self.seq_length])
-                                axs[i, j].set_ylim([self.ds.min_data, self.ds.max_data])
-
-                        plt.savefig(str(self.results_folder / f'sample-{self.step}.png'), dpi=100)
-                        # clear plt
-                        plt.clf()
-
+                        all_images = torch.cat(all_images_list, dim = 0)
+                        utils.save_image(all_images, str(self.results_folder / f'sample-{self.step}.png'), nrow = int(math.sqrt(self.num_samples)))
+                        # save image_classes to txt file
+                        fmt = '%d'
+                        np.savetxt(str(self.results_folder / f'sample-{self.step}.txt'), image_classes.cpu().numpy(), fmt=fmt)
                         self.save(milestone)
 
                 pbar.update(1)
