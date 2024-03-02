@@ -1,5 +1,12 @@
 # diffusion_tutorial
 
+This tutorial code is based on the implementation from:
+https://github.com/lucidrains/denoising-diffusion-pytorch
+
+Some modifications and fixes were made to the original code.
+
+## Installation
+
 Create a new environment with Python 3.10 and install the package in editable mode:
 
 ```bash
@@ -37,7 +44,7 @@ python sampler_2d.py --model-dir models
 2. Run the training script
 
 ```bash
-# Input your data and output dir. The channels is the number of channels in the input data
+# Input your data path and output dir. The seq-length is the length of the input sequence
 python trainer_1d.py --input-file data.h5 --output-dir models [--seq-length 480]
 ```
 
@@ -48,10 +55,3 @@ python trainer_1d.py --input-file data.h5 --output-dir models [--seq-length 480]
 ```bash
 python sampler_1d.py --model-dir models
 ```
-
-## References
-
-This tutorial code is based on the implementation from:
-https://github.com/lucidrains/denoising-diffusion-pytorch
-
-Some modifications and fixes were made to the original code.
