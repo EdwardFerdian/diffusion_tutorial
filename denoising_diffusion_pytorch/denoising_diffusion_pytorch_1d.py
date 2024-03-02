@@ -710,11 +710,11 @@ class Dataset1D(Dataset):
     def __init__(
         self,
         h5_filepath,
-        seq_size,
+        seq_length,
     ):
         super().__init__()
         self.h5_filepath = h5_filepath
-        self.seq_size = seq_size
+        self.seq_length = seq_length
         
         # open h5
         h5handler = h5py.File(h5_filepath, 'r')
@@ -739,7 +739,7 @@ class Dataset1D(Dataset):
 
     def __getitem__(self, index):
         seq = self.data[index]
-        seq = seq[:self.seq_size]
+        seq = seq[:self.seq_length]
         # add first dim
         seq = np.expand_dims(seq, axis=0)
         # return self.transform(seq)
@@ -792,7 +792,7 @@ class Trainer1D(object):
         self.max_grad_norm = max_grad_norm
 
         self.train_num_steps = train_num_steps
-        self.seq_size = diffusion_model.seq_length
+        self.seq_length = diffusion_model.seq_length
 
         # dataset and dataloader
 
@@ -800,7 +800,7 @@ class Trainer1D(object):
             self.ds = None
             self.dl = None
         else:
-            self.ds = Dataset1D(input_filepath, self.seq_size)
+            self.ds = Dataset1D(input_filepath, self.seq_length)
             dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
 
             dl = self.accelerator.prepare(dl)
@@ -911,7 +911,7 @@ class Trainer1D(object):
                         all_images = torch.cat(all_result_samples, dim = 0)
                         all_images = all_images.squeeze(1)
                         all_images = all_images.cpu().numpy()
-                        print(all_images.shape)
+                        
                         # save as txt
                         np.savetxt(str(self.results_folder / f'sample-{self.step}.txt'), all_images)
 
@@ -925,7 +925,7 @@ class Trainer1D(object):
                         for i in range(nrow):
                             for j in range(ncol):
                                 axs[i, j].plot(all_images[i * nrow + j])
-                                axs[i, j].set_xlim([0, self.seq_size])
+                                axs[i, j].set_xlim([0, self.seq_length])
                                 axs[i, j].set_ylim([self.ds.min_data, self.ds.max_data])
 
                         plt.savefig(str(self.results_folder / f'sample-{self.step}.png'), dpi=100)

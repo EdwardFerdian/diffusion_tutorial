@@ -57,8 +57,6 @@ if __name__ == "__main__":
         for i in range(total_samples//batch_size):
             sampled_images = trainer.ema.ema_model.sample(batch_size=batch_size)
 
-            print(sampled_images.shape)
-
             samples = sampled_images.cpu().detach().numpy() # b, c, seq_length
 
             # squeeze channel dimension

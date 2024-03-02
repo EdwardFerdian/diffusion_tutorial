@@ -73,6 +73,7 @@ python sampler_cfg_2d.py --model-dir [model_dir] [--num-classes 10]
 
 ## 1D diffusion model
 
+
 #### Training
 
 1. Prepare your data in a HDF5 file with containing an _input_ column
