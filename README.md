@@ -3,7 +3,7 @@
 This tutorial code is based on the implementation from:
 https://github.com/lucidrains/denoising-diffusion-pytorch
 
-Some modifications and fixes were made to the original code.
+Some modifications and fixes were made to the original code for the purpose of this example tutorial.
 
 ## Installation
 
@@ -17,14 +17,18 @@ pip install -e .
 
 ## 2D diffusion model
 
+### Unconditional diffusion model
+
+For unconditional diffusion, you have to put the data directly under the 'data' folder.
+
 #### Training
 
-1. Put the data in the `data` folder
+1. Put the images in the `data` folder
 2. Run the training script
 
 ```bash
 # Input your data and output dir. The channels is the number of channels in the input data
-python trainer_2d.py --data-dir data --output-dir models [--channels 3]
+python trainer_2d.py --data-dir [data_dir] --output-dir [model_dir] [--channels 3]
 
 ```
 

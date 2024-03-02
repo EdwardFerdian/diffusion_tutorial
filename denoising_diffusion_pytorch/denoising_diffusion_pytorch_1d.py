@@ -45,7 +45,6 @@ def identity(t, *args, **kwargs):
 def cycle(dl):
     while True:
         for data in dl:
-            # print(data.shape)
             yield data
 
 def has_int_squareroot(num):
@@ -720,7 +719,7 @@ class Dataset1D(Dataset):
         # open h5
         h5handler = h5py.File(h5_filepath, 'r')
         self.data = np.asarray(h5handler["input"])
-        print(self.data.shape)
+        
         print(f"Before norm {np.min(self.data)} {np.max(self.data)}")
 
         # normalize data 

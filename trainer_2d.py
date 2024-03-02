@@ -2,8 +2,6 @@ from denoising_diffusion_pytorch import Unet, GaussianDiffusion, Trainer
 import argparse
 
 if __name__ == "__main__":
-    # read data_dir and output_dir from command line
-    
     parser = argparse.ArgumentParser(description='Train a diffusion model')
     parser.add_argument('--data-dir', type=str, required=True, help='Directory containing the training images')
     parser.add_argument('--output-dir', type=str, required=True, help='Directory to save the trained model')
