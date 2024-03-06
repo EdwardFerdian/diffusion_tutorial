@@ -5,6 +5,12 @@ https://github.com/lucidrains/denoising-diffusion-pytorch
 
 Some modifications and fixes were made to the original code for the purpose of this example tutorial.
 
+## Notebook example
+
+You can find a notebook example in the `notebooks` folder. The notebook contains a quick and easy demo to train a 2D diffusion model.
+
+For other examples, you can follow the instructions below.
+
 ## Installation
 
 Create a new environment with Python 3.10 and install the package in editable mode:
